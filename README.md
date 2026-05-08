@@ -137,9 +137,10 @@ iris-dev exposes 23 tools to your AI assistant:
 | `iris_test` | — | Run `%UnitTest` tests and return structured pass/fail results. Works over HTTP (no docker required); uses docker exec if `IRIS_CONTAINER` is set. |
 | `iris_production` | ✓ | Start, stop, update, check, or recover an Interoperability production. |
 | `iris_interop_query` | ✓ | Query production logs, queue depths, or message archive. |
-| `iris_containers` | ✓ | List, select, or start IRIS Docker containers. |
+| `iris_containers` | ✓ | List, select, or start IRIS Docker containers. `iris_select_container` now hot-swaps the active connection — no session restart required. |
 | `iris_admin` | — | IRIS administration: list namespaces, databases, users, roles, web apps; check permissions; create/delete users, namespaces, webapps (requires `IRIS_ADMIN_TOOLS=1`). |
 | `iris_get_log` | — | Retrieve a stored result by `log_id` from the progressive disclosure store. With `id`: returns the full result (paginated with `limit`/`offset`). Without `id`: lists all stored log entries. Use when a tool returns `truncated: true`. |
+| `check_config` | — | Inspect active IRIS connection state — host, container, config file, last loaded time, write tools status. Always succeeds; never returns `IRIS_UNREACHABLE`. Use to diagnose connection issues or verify hot-reload completed. |
 | `skill` | ✓ | Manage the local skills registry (list, describe, search, forget). |
 | `skill_community` | ✓ | Browse community skills. |
 | `kb` | ✓ | Index markdown files into a searchable knowledge base. |

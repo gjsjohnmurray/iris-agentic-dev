@@ -3,7 +3,7 @@ use clap::Args;
 use iris_dev_core::{
     iris::discovery::{discover_iris, IrisDiscovery},
     skills::SkillRegistry,
-    tools::{IrisTools, Toolset},
+    tools::{ConfigWatcher, IrisTools, Toolset},
 };
 use rmcp::{transport::stdio, ServiceExt};
 use tokio::sync::watch;
@@ -176,7 +176,9 @@ impl McpCommand {
             _setmode(1, O_BINARY); // stdout
         }
 
-        let tools = IrisTools::with_registry_and_toolset(iris, registry, toolset)?;
+        // Build ConfigWatcher for .iris-dev.toml hot-reload (034-live-connection-reload).
+        let config_watcher = ConfigWatcher::new(ws_root.join(".iris-dev.toml"));
+        let tools = IrisTools::with_registry_and_toolset(iris, registry, toolset, config_watcher)?;
 
         // FR-007: periodically sweep expired elicitation entries.
         {

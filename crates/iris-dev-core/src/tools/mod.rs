@@ -56,6 +56,92 @@ pub const ERR_NO_TESTS_FOUND: &str = "NO_TESTS_FOUND";
 pub const ERR_NAMESPACE_NOT_FOUND: &str = "NAMESPACE_NOT_FOUND";
 pub const ERR_TEST_EXECUTION_ERROR: &str = "TEST_EXECUTION_ERROR";
 
+// ── Live connection hot-reload types (034) ───────────────────────────────────
+
+/// How the currently active IRIS connection was established.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionSource {
+    ConfigFile,
+    EnvVars,
+    IrisSelectContainer,
+    AutoDiscovered,
+}
+
+/// Snapshot of the active IRIS connection, including metadata for `check_config`.
+pub struct ConnectionState {
+    pub iris: Option<Arc<IrisConnection>>,
+    pub source: ConnectionSource,
+    pub config_file: Option<std::path::PathBuf>,
+    pub loaded_at: std::time::SystemTime,
+    pub write_tools_enabled: bool,
+    pub config_parse_error: Option<String>,
+}
+
+impl ConnectionState {
+    pub fn new_disconnected(source: ConnectionSource) -> Self {
+        Self {
+            iris: None,
+            source,
+            config_file: None,
+            loaded_at: std::time::SystemTime::now(),
+            write_tools_enabled: true,
+            config_parse_error: None,
+        }
+    }
+
+    pub fn from_iris(
+        iris: IrisConnection,
+        source: ConnectionSource,
+        config_file: Option<std::path::PathBuf>,
+    ) -> Self {
+        let write_tools_enabled = iris.is_write_allowed();
+        Self {
+            iris: Some(Arc::new(iris)),
+            source,
+            config_file,
+            loaded_at: std::time::SystemTime::now(),
+            write_tools_enabled,
+            config_parse_error: None,
+        }
+    }
+}
+
+/// Tracks the `.iris-dev.toml` path and last-seen mtime for lazy hot-reload.
+/// Stored as `Option<ConfigWatcher>` on `IrisTools`; None when no config file exists.
+pub struct ConfigWatcher {
+    pub config_path: std::path::PathBuf,
+    pub last_mtime: std::time::SystemTime,
+}
+
+impl ConfigWatcher {
+    pub fn new(config_path: std::path::PathBuf) -> Option<Self> {
+        let mtime = std::fs::metadata(&config_path)
+            .and_then(|m| m.modified())
+            .ok()?;
+        Some(Self {
+            config_path,
+            last_mtime: mtime,
+        })
+    }
+
+    /// Returns true (and updates stored mtime) if the file has been modified since last check.
+    pub fn has_changed(&mut self) -> bool {
+        let Ok(meta) = std::fs::metadata(&self.config_path) else {
+            return false;
+        };
+        let Ok(mtime) = meta.modified() else {
+            return false;
+        };
+        if mtime > self.last_mtime {
+            self.last_mtime = mtime;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// A single tool call entry for the session history ring buffer.
 #[derive(Debug, Clone)]
 pub struct ToolCallEntry {
@@ -736,7 +822,11 @@ pub fn translate_symbols_query(limit: usize, query: &str) -> (String, Vec<serde_
 
 #[derive(Clone)]
 pub struct IrisTools {
-    pub iris: Option<Arc<IrisConnection>>,
+    /// Active connection state — wraps iris, source, config metadata, write gate.
+    /// Arc<Mutex> allows atomic swap from &self tool handlers (034-live-connection-reload).
+    pub connection: Arc<std::sync::Mutex<ConnectionState>>,
+    /// Lazy config file watcher for hot-reload. None when no .iris-dev.toml exists.
+    pub config_watcher: Arc<std::sync::Mutex<Option<ConfigWatcher>>>,
     pub registry: Arc<crate::skills::SkillRegistry>,
     /// Shared HTTP client — created once, reused across all tool calls.
     pub client: Arc<reqwest::Client>,
@@ -748,9 +838,6 @@ pub struct IrisTools {
     pub log_store: Arc<std::sync::Mutex<log_store::LogStore>>,
     /// Active toolset — controls which tools are registered.
     pub toolset: Toolset,
-    /// Whether write-capable interop/credential/lookup tools are available.
-    /// Set at construction time from IrisConnection.is_write_allowed() (issue #26).
-    pub write_tools_enabled: bool,
     tool_router: ToolRouter<IrisTools>,
 }
 
@@ -758,7 +845,10 @@ pub struct IrisTools {
 impl IrisTools {
     pub fn new(iris: Option<IrisConnection>) -> anyhow::Result<Self> {
         let client = Arc::new(IrisConnection::http_client()?);
-        let write_tools_enabled = iris.as_ref().map(|c| c.is_write_allowed()).unwrap_or(true);
+        let conn_state = match iris {
+            Some(c) => ConnectionState::from_iris(c, ConnectionSource::EnvVars, None),
+            None => ConnectionState::new_disconnected(ConnectionSource::EnvVars),
+        };
         let log_max = std::env::var("IRIS_LOG_STORE_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -768,7 +858,8 @@ impl IrisTools {
             .and_then(|v| v.parse().ok())
             .unwrap_or(60u64);
         Ok(Self {
-            iris: iris.map(Arc::new),
+            connection: Arc::new(std::sync::Mutex::new(conn_state)),
+            config_watcher: Arc::new(std::sync::Mutex::new(None)),
             registry: Arc::new(crate::skills::SkillRegistry::new()),
             client,
             history: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(50))),
@@ -777,7 +868,6 @@ impl IrisTools {
                 log_max, log_ttl,
             ))),
             toolset: Toolset::Baseline,
-            write_tools_enabled,
             tool_router: Self::tool_router(),
         })
     }
@@ -786,7 +876,7 @@ impl IrisTools {
         iris: Option<IrisConnection>,
         toolset: Toolset,
     ) -> anyhow::Result<Self> {
-        Self::with_registry_and_toolset(iris, crate::skills::SkillRegistry::new(), toolset)
+        Self::with_registry_and_toolset(iris, crate::skills::SkillRegistry::new(), toolset, None)
     }
 
     /// Returns the set of tool names registered for the current toolset.
@@ -842,6 +932,8 @@ impl IrisTools {
             "iris_lookup_transfer",
             // 026-admin-tools
             "iris_admin",
+            // 034-live-connection-reload
+            "check_config",
         ];
 
         // Tools removed in nostub — 4 stubs returning NOT_IMPLEMENTED
@@ -906,7 +998,7 @@ impl IrisTools {
                     names.insert(s.to_string());
                 }
                 // Apply write-gate: remove write-only tools if not write-allowed
-                if !self.write_tools_enabled {
+                if !self.write_tools_enabled() {
                     let write_gated: &[&str] = &["iris_production_item", "iris_credential_manage"];
                     for s in write_gated {
                         names.remove(*s);
@@ -921,12 +1013,13 @@ impl IrisTools {
         iris: Option<IrisConnection>,
         registry: crate::skills::SkillRegistry,
     ) -> anyhow::Result<Self> {
-        Self::with_registry_and_toolset(iris, registry, Toolset::Baseline)
+        Self::with_registry_and_toolset(iris, registry, Toolset::Baseline, None)
     }
     pub fn with_registry_and_toolset(
         iris: Option<IrisConnection>,
         registry: crate::skills::SkillRegistry,
         toolset: Toolset,
+        config_watcher: Option<ConfigWatcher>,
     ) -> anyhow::Result<Self> {
         let client = Arc::new(IrisConnection::http_client()?);
         let mut router = Self::tool_router();
@@ -1006,26 +1099,26 @@ impl IrisTools {
             }
         }
 
-        let write_tools_enabled = iris.as_ref().map(|c| c.is_write_allowed()).unwrap_or(true);
-
-        // Remove write-capable interop tools when not write-allowed (issue #26 env guard).
-        // These tools are always registered by #[tool_router]; we prune at construction time.
-        if !write_tools_enabled && toolset == Toolset::Merged {
-            let write_gated: &[&str] = &["iris_production_item", "iris_credential_manage"];
-            for name in write_gated {
-                router.remove_route(name);
+        let conn_state = match iris {
+            Some(c) => {
+                let write_tools_enabled = c.is_write_allowed();
+                tracing::info!(
+                    system_mode = ?c.system_mode,
+                    write_tools_enabled,
+                    namespace = %c.namespace,
+                    "iris-dev: write tool gate evaluated"
+                );
+                // Remove write-capable tools if not allowed (issue #26 env guard).
+                if !write_tools_enabled && toolset == Toolset::Merged {
+                    let write_gated: &[&str] = &["iris_production_item", "iris_credential_manage"];
+                    for name in write_gated {
+                        router.remove_route(name);
+                    }
+                }
+                ConnectionState::from_iris(c, ConnectionSource::AutoDiscovered, None)
             }
-        }
-
-        // Log connection status and write-tool availability.
-        if let Some(ref c) = iris {
-            tracing::info!(
-                system_mode = ?c.system_mode,
-                write_tools_enabled,
-                namespace = %c.namespace,
-                "iris-dev: write tool gate evaluated"
-            );
-        }
+            None => ConnectionState::new_disconnected(ConnectionSource::EnvVars),
+        };
 
         let log_max = std::env::var("IRIS_LOG_STORE_MAX")
             .ok()
@@ -1037,7 +1130,8 @@ impl IrisTools {
             .unwrap_or(60u64);
 
         Ok(Self {
-            iris: iris.map(Arc::new),
+            connection: Arc::new(std::sync::Mutex::new(conn_state)),
+            config_watcher: Arc::new(std::sync::Mutex::new(config_watcher)),
             registry: Arc::new(registry),
             client,
             history: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(50))),
@@ -1046,12 +1140,108 @@ impl IrisTools {
                 log_max, log_ttl,
             ))),
             toolset,
-            write_tools_enabled,
             tool_router: router,
         })
     }
-    fn get_iris(&self) -> Result<&IrisConnection, McpError> {
-        self.iris.as_deref().ok_or_else(iris_unreachable)
+
+    /// Returns the active IRIS connection, or IRIS_UNREACHABLE if not connected.
+    fn get_iris(&self) -> Result<Arc<IrisConnection>, McpError> {
+        self.connection
+            .lock()
+            .unwrap()
+            .iris
+            .clone()
+            .ok_or_else(iris_unreachable)
+    }
+
+    /// Check for config file changes then return the active connection.
+    /// Use this in tool handlers instead of get_iris() to enable hot-reload (034).
+    async fn get_iris_reloaded(&self) -> Result<Arc<IrisConnection>, McpError> {
+        self.check_reload().await;
+        self.get_iris()
+    }
+
+    /// Returns the active write_tools_enabled flag from connection state.
+    fn write_tools_enabled(&self) -> bool {
+        self.connection.lock().unwrap().write_tools_enabled
+    }
+
+    /// Returns the active connection as Option<Arc>, for interop helpers that take Option<&IrisConnection>.
+    fn iris_arc(&self) -> Option<Arc<IrisConnection>> {
+        self.connection.lock().unwrap().iris.clone()
+    }
+
+    /// Check if `.iris-dev.toml` has changed since last load; if so, reload and re-probe.
+    /// Called at the start of every tool handler for lazy hot-reload (034).
+    /// Completely silent — no error returned to caller on reload failure.
+    async fn check_reload(&self) {
+        // Check if watcher says config changed
+        let changed = {
+            let mut w = self.config_watcher.lock().unwrap();
+            w.as_mut().map(|w| w.has_changed()).unwrap_or(false)
+        };
+        if !changed {
+            return;
+        }
+
+        // Config file changed — reload and re-probe
+        let config_path = {
+            let w = self.config_watcher.lock().unwrap();
+            w.as_ref().map(|w| w.config_path.clone())
+        };
+        let Some(config_path) = config_path else {
+            return;
+        };
+
+        let config_file_str = config_path
+            .parent()
+            .and_then(|p| p.to_str())
+            .map(|s| s.to_string());
+
+        // Parse the new config
+        let cfg = crate::iris::workspace_config::load_workspace_config(config_file_str.as_deref());
+
+        let conn_result = match cfg {
+            None => {
+                // File parse error or missing — set error in state, keep old connection
+                let mut conn = self.connection.lock().unwrap();
+                conn.config_parse_error =
+                    Some("Config file changed but could not be parsed".to_string());
+                return;
+            }
+            Some(cfg) => {
+                crate::iris::workspace_config::workspace_config_to_connection(&cfg, "USER")
+            }
+        };
+
+        // Probe the new connection
+        let mut new_conn = match conn_result {
+            Some(c) => c,
+            None => {
+                // container= config — let discovery find it via IRIS_CONTAINER env
+                match crate::iris::discovery::discover_iris(None).await {
+                    crate::iris::discovery::IrisDiscovery::Found(c) => c,
+                    _ => {
+                        let mut conn = self.connection.lock().unwrap();
+                        conn.config_parse_error = Some(
+                            "Hot-reload: could not discover IRIS connection from updated config"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+
+        new_conn.probe().await;
+
+        // Atomically swap connection
+        let new_state =
+            ConnectionState::from_iris(new_conn, ConnectionSource::ConfigFile, Some(config_path));
+        let mut conn = self.connection.lock().unwrap();
+        *conn = new_state;
+        conn.config_parse_error = None;
+        tracing::info!("iris-dev: hot-reloaded connection from .iris-dev.toml");
     }
     fn http_client(&self) -> &reqwest::Client {
         &self.client
@@ -1076,7 +1266,7 @@ impl IrisTools {
         &self,
         Parameters(p): Parameters<CompileParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         tracing::info!(namespace = %p.namespace, target = %p.target, "iris_compile");
         let client = self.http_client();
 
@@ -1748,7 +1938,7 @@ impl IrisTools {
         &self,
         Parameters(p): Parameters<ExecuteParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         tracing::info!(namespace = %p.namespace, "iris_execute");
         let client = self.http_client();
         let timeout = std::time::Duration::from_secs(p.timeout);
@@ -1831,10 +2021,10 @@ impl IrisTools {
         &self,
         Parameters(p): Parameters<IrisDocParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         tracing::info!(namespace = %p.namespace, "iris_doc");
         let client = self.http_client();
-        let result = doc::handle_iris_doc(iris, client, p, &self.elicitation_store).await;
+        let result = doc::handle_iris_doc(&iris, client, p, &self.elicitation_store).await;
         self.record_call("iris_doc", result.is_ok());
         result
     }
@@ -1849,7 +2039,7 @@ impl IrisTools {
         tracing::info!(namespace = %p.namespace, force = p.force, "iris_query");
 
         // SQL safety gate — validate before any network call
-        let skip_validation = p.force && self.write_tools_enabled;
+        let skip_validation = p.force && self.write_tools_enabled();
         if !skip_validation {
             match validate_read_only_sql(&p.query) {
                 Err(ref kw) if kw == "EMPTY" => {
@@ -1868,7 +2058,7 @@ impl IrisTools {
                         "error": format!("Destructive SQL keyword '{}' is not allowed. Use force: true to override.", kw),
                         "blocked_keyword": kw,
                     });
-                    if p.force && !self.write_tools_enabled {
+                    if p.force && !self.write_tools_enabled() {
                         resp["force_ignored"] = serde_json::Value::Bool(true);
                     }
                     return ok_json(resp);
@@ -1877,7 +2067,7 @@ impl IrisTools {
             }
         }
 
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         let client = self.http_client();
         let query_url = iris.versioned_ns_url(&p.namespace, "/action/query");
         let resp = client
@@ -1924,6 +2114,7 @@ impl IrisTools {
         &self,
         Parameters(p): Parameters<ListContainersParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.check_reload().await;
         let workspace_basename = p
             .workspace_root
             .as_deref()
@@ -1970,7 +2161,8 @@ impl IrisTools {
         };
         // Add active_connection info so agents can detect workspace_config mismatches
         // without a separate iris_info call.
-        let active_connection_json = match &self.iris {
+        let iris_arc = self.iris_arc();
+        let active_connection_json = match &iris_arc {
             None => serde_json::Value::Null,
             Some(conn) => {
                 // Extract container name from DiscoverySource if available.
@@ -1992,7 +2184,7 @@ impl IrisTools {
         // Detect mismatch: workspace_config specifies a container but we're connected
         // to something different (or no container at all).
         let mismatch = if let (Some(cfg_container), Some(conn)) =
-            (workspace_config_json["container"].as_str(), &self.iris)
+            (workspace_config_json["container"].as_str(), &iris_arc)
         {
             match &conn.source {
                 crate::iris::connection::DiscoverySource::Docker { container_name } => {
@@ -2034,12 +2226,13 @@ impl IrisTools {
     }
 
     #[tool(
-        description = "Validate and return connection parameters for the specified IRIS container. Does NOT hot-swap the active connection (restart the MCP session to switch containers). Returns probed version and port info so the caller can configure a new session."
+        description = "Switch the active IRIS connection to the specified running Docker container for this session. After a successful switch, all subsequent tool calls target the new container — no session restart required. Fixes issue #11."
     )]
     async fn iris_select_container(
         &self,
         Parameters(p): Parameters<SelectContainerParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.check_reload().await;
         let workspace_basename = String::new();
 
         let containers = list_iris_containers(&workspace_basename).await;
@@ -2055,6 +2248,7 @@ impl IrisTools {
                     .filter_map(|c| c["name"].as_str())
                     .collect();
                 return ok_json(serde_json::json!({
+                    "success": false,
                     "error": "CONTAINER_NOT_FOUND",
                     "requested": p.name,
                     "available": available,
@@ -2066,9 +2260,6 @@ impl IrisTools {
         let port_web = container["port_web"].as_u64().unwrap_or(52773) as u16;
         let base_url = format!("http://localhost:{}", port_web);
 
-        // Bug 5: the old code built new_conn and immediately dropped it without storing it.
-        // IrisTools.iris is Arc<IrisConnection> behind &self — can't be mutated here.
-        // Instead, probe the connection to verify it works and return accurate info.
         let mut new_conn = crate::iris::connection::IrisConnection::new(
             &base_url,
             &p.namespace,
@@ -2080,17 +2271,128 @@ impl IrisTools {
         );
         new_conn.port_superserver = Some(port_superserver);
         new_conn.probe().await;
+
+        // Check if probe succeeded (version populated means reachable)
+        if new_conn.version.is_none() {
+            return ok_json(serde_json::json!({
+                "success": false,
+                "error": "CONTAINER_UNREACHABLE",
+                "container": p.name,
+                "port_web": port_web,
+                "message": "Container found but Atelier REST API did not respond. Check that the container is running and the web server is accessible.",
+            }));
+        }
+
         let version = new_conn.version.clone();
+        let write_tools_enabled = new_conn.is_write_allowed();
+
+        // Atomically swap the active connection (fixes issue #11).
+        let new_state =
+            ConnectionState::from_iris(new_conn, ConnectionSource::IrisSelectContainer, None);
+        {
+            let mut conn = self.connection.lock().unwrap();
+            *conn = new_state;
+        }
+
+        tracing::info!(container = %p.name, "iris-dev: switched connection via iris_select_container");
 
         ok_json(serde_json::json!({
             "status": "ok",
+            "switched": true,
             "container": p.name,
             "port_superserver": port_superserver,
             "port_web": port_web,
             "namespace": p.namespace,
             "version": version,
-            "note": "Connection parameters validated. Restart the MCP session (set IRIS_HOST/IRIS_WEB_PORT) to switch containers.",
+            "write_tools_enabled": write_tools_enabled,
         }))
+    }
+
+    #[tool(
+        description = "Return the active IRIS connection state without making any IRIS network calls. Always succeeds — never returns IRIS_UNREACHABLE. Use to diagnose connection issues, verify hot-reload completed, confirm which container is active, or check if write tools are enabled. Fields: connected, host, port, namespace, container, config_file, config_loaded_at, iris_version, write_tools_enabled, connection_source."
+    )]
+    async fn check_config(
+        &self,
+        Parameters(_p): Parameters<crate::tools::NoParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.check_reload().await;
+        let conn = self.connection.lock().unwrap();
+
+        let (host, port, namespace, container, iris_version) = match &conn.iris {
+            Some(iris) => {
+                // Parse host and port from base_url (e.g. "http://localhost:52780")
+                let base = iris
+                    .base_url
+                    .trim_start_matches("http://")
+                    .trim_start_matches("https://");
+                let (host_port, _path) = base.split_once('/').unwrap_or((base, ""));
+                let (host_str, port_str) =
+                    host_port.rsplit_once(':').unwrap_or((host_port, "52773"));
+                let host = host_str.to_string();
+                let port = port_str.parse::<u64>().unwrap_or(52773);
+                let namespace = iris.namespace.clone();
+                let container = match &iris.source {
+                    crate::iris::connection::DiscoverySource::Docker { container_name } => {
+                        serde_json::Value::String(container_name.clone())
+                    }
+                    _ => serde_json::Value::Null,
+                };
+                let version = iris
+                    .version
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null);
+                (host, port, namespace, container, version)
+            }
+            None => (
+                String::new(),
+                52773u64,
+                String::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+        };
+
+        let config_file = conn
+            .config_file
+            .as_ref()
+            .and_then(|p| p.to_str())
+            .map(|s| serde_json::Value::String(s.to_string()))
+            .unwrap_or(serde_json::Value::Null);
+
+        let config_loaded_at = conn
+            .loaded_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| {
+                // Format as ISO 8601
+                let secs = d.as_secs();
+                let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
+                    .unwrap_or_default();
+                serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            })
+            .unwrap_or(serde_json::Value::Null);
+
+        let connection_source =
+            serde_json::to_value(&conn.source).unwrap_or(serde_json::Value::Null);
+
+        let mut response = serde_json::json!({
+            "connected": conn.iris.is_some(),
+            "host": host,
+            "port": port,
+            "namespace": namespace,
+            "container": container,
+            "config_file": config_file,
+            "config_loaded_at": config_loaded_at,
+            "iris_version": iris_version,
+            "write_tools_enabled": conn.write_tools_enabled,
+            "connection_source": connection_source,
+        });
+
+        if let Some(ref err) = conn.config_parse_error {
+            response["config_parse_error"] = serde_json::Value::String(err.clone());
+        }
+
+        ok_json(response)
     }
 
     #[tool(
@@ -2178,7 +2480,7 @@ impl IrisTools {
         &self,
         Parameters(p): Parameters<SymbolsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         let client = self.http_client();
         let (sql, params) = translate_symbols_query(p.limit, &p.query);
         match iris.query(&sql, params, &p.namespace, client).await {
@@ -2250,7 +2552,7 @@ impl IrisTools {
         &self,
         Parameters(p): Parameters<IntrospectParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         let client = self.http_client();
         // Bug 15: use parameterized queries instead of manual string escaping.
         let methods = iris.query(
@@ -2286,7 +2588,7 @@ impl IrisTools {
                 p.offset = o;
             }
         }
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         let _client = self.http_client();
         let code = format!(
             "Write ##class(%Studio.Debugger).SourceLine(\"{}\",{})",
@@ -2313,7 +2615,7 @@ impl IrisTools {
         &self,
         Parameters(_p): Parameters<CapturePacketParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         let client = self.http_client();
         match iris.query("SELECT TOP 20 ErrorCode,ErrorText,TimeStamp FROM %SYSTEM.Error ORDER BY TimeStamp DESC", vec![], &_p.namespace, client).await {
             Ok(resp) => ok_json(serde_json::json!({"success": true, "errors": resp["result"]["content"]})),
@@ -2326,7 +2628,7 @@ impl IrisTools {
         &self,
         Parameters(p): Parameters<ErrorLogsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         let client = self.http_client();
         // FR-012: cap max_entries to prevent runaway queries.
         let max_entries = p.max_entries.min(1000);
@@ -2358,7 +2660,7 @@ impl IrisTools {
         &self,
         Parameters(p): Parameters<SourceMapParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         let _client = self.http_client();
         let cls_name = p.cls_name.trim_end_matches(".cls");
         // Build source map by querying %Studio.Debugger for each .INT method
@@ -2418,7 +2720,7 @@ impl IrisTools {
         let class_name =
             extract_class_name(&class_text).unwrap_or_else(|| "Generated.Class".to_string());
 
-        if let Some(iris) = self.iris.as_deref() {
+        if let Some(iris) = self.iris_arc().as_deref() {
             let _client = self.http_client();
             let code = format!(
                 "Set sc=$SYSTEM.OBJ.Compile(\"{}\",\"ck-d\") Write $System.Status.IsOK(sc)",
@@ -2485,7 +2787,7 @@ Original: {}",
             )
         })?;
 
-        let introspection_context = if let Some(iris) = self.iris.as_deref() {
+        let introspection_context = if let Some(iris) = self.iris_arc().as_deref() {
             let client = self.http_client();
             // FR-001/C1: use parameterized query to prevent SQL injection via class_name.
             iris.query(
@@ -2541,7 +2843,7 @@ Methods:
 
     #[tool(description = "List all synthesized skills in the registry.")]
     async fn skill_list(&self, _: Parameters<NoParams>) -> Result<CallToolResult, McpError> {
-        if let Some(iris) = self.iris.as_deref() {
+        if let Some(iris) = self.iris_arc().as_deref() {
             let code = "Set key=\"\" Set result=\"[\" Set sep=\"\" For { Set key=$Order(^SKILLS(key)) Quit:key=\"\" Set skill=$Get(^SKILLS(key)) Set result=result_sep_skill Set sep=\",\" } Set result=result_\"]\" Write result";
             if let Ok(output) = iris
                 .execute(code, &crate::tools::skills_tools::skills_namespace())
@@ -2561,7 +2863,7 @@ Methods:
         &self,
         Parameters(p): Parameters<SkillNameParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(iris) = self.iris.as_deref() {
+        if let Some(iris) = self.iris_arc().as_deref() {
             let code = format!("Write $Get(^SKILLS(\"{}\"))", p.name.replace('"', "\\\""));
             if let Ok(output) = iris
                 .execute(&code, &crate::tools::skills_tools::skills_namespace())
@@ -2582,7 +2884,7 @@ Methods:
         &self,
         Parameters(p): Parameters<SkillSearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(iris) = self.iris.as_deref() {
+        if let Some(iris) = self.iris_arc().as_deref() {
             let query_lower = p.query.to_lowercase();
             let q = query_lower.replace('"', "");
             let code = format!(
@@ -2617,7 +2919,7 @@ Methods:
         &self,
         Parameters(p): Parameters<SkillNameParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(iris) = self.iris.as_deref() {
+        if let Some(iris) = self.iris_arc().as_deref() {
             let code = format!(
                 "Kill ^SKILLS(\"{}\") Write \"OK\"",
                 p.name.replace('"', "\\\"")
@@ -2723,9 +3025,9 @@ Methods:
         &self,
         Parameters(p): Parameters<KbIndexParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         skills_tools::handle_kb(
-            iris,
+            &iris,
             self.http_client(),
             skills_tools::KbParams {
                 action: "index".into(),
@@ -2844,7 +3146,7 @@ Methods:
         &self,
         Parameters(p): Parameters<interop::ProductionStatusParams>,
     ) -> Result<CallToolResult, McpError> {
-        interop::interop_production_status_impl(self.iris.as_deref(), p).await
+        interop::interop_production_status_impl(self.iris_arc().as_deref(), p).await
     }
 
     #[tool(description = "Start a named IRIS Interoperability production.")]
@@ -2852,7 +3154,7 @@ Methods:
         &self,
         Parameters(p): Parameters<interop::ProductionNameParams>,
     ) -> Result<CallToolResult, McpError> {
-        interop::interop_production_start_impl(self.iris.as_deref(), p).await
+        interop::interop_production_start_impl(self.iris_arc().as_deref(), p).await
     }
 
     #[tool(
@@ -2862,7 +3164,7 @@ Methods:
         &self,
         Parameters(p): Parameters<interop::ProductionStopParams>,
     ) -> Result<CallToolResult, McpError> {
-        interop::interop_production_stop_impl(self.iris.as_deref(), p).await
+        interop::interop_production_stop_impl(self.iris_arc().as_deref(), p).await
     }
 
     #[tool(description = "Hot-apply configuration changes to the running production.")]
@@ -2870,7 +3172,7 @@ Methods:
         &self,
         Parameters(p): Parameters<interop::ProductionUpdateParams>,
     ) -> Result<CallToolResult, McpError> {
-        interop::interop_production_update_impl(self.iris.as_deref(), p).await
+        interop::interop_production_update_impl(self.iris_arc().as_deref(), p).await
     }
 
     #[tool(
@@ -2880,7 +3182,7 @@ Methods:
         &self,
         Parameters(p): Parameters<interop::ProductionNeedsUpdateParams>,
     ) -> Result<CallToolResult, McpError> {
-        interop::interop_production_needs_update_impl(self.iris.as_deref(), p).await
+        interop::interop_production_needs_update_impl(self.iris_arc().as_deref(), p).await
     }
 
     #[tool(description = "Recover a troubled IRIS Interoperability production.")]
@@ -2888,7 +3190,7 @@ Methods:
         &self,
         Parameters(p): Parameters<interop::ProductionRecoverParams>,
     ) -> Result<CallToolResult, McpError> {
-        interop::interop_production_recover_impl(self.iris.as_deref(), p).await
+        interop::interop_production_recover_impl(self.iris_arc().as_deref(), p).await
     }
 
     #[tool(
@@ -2898,12 +3200,12 @@ Methods:
         &self,
         Parameters(p): Parameters<interop::LogsParams>,
     ) -> Result<CallToolResult, McpError> {
-        interop::interop_logs_impl(self.iris.as_deref(), p).await
+        interop::interop_logs_impl(self.iris_arc().as_deref(), p).await
     }
 
     #[tool(description = "Get all current Interoperability message queues and their depths.")]
     async fn interop_queues(&self, _: Parameters<NoParams>) -> Result<CallToolResult, McpError> {
-        interop::interop_queues_impl(self.iris.as_deref()).await
+        interop::interop_queues_impl(self.iris_arc().as_deref()).await
     }
 
     #[tool(
@@ -2913,7 +3215,7 @@ Methods:
         &self,
         Parameters(p): Parameters<interop::MessageSearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        interop::interop_message_search_impl(self.iris.as_deref(), p).await
+        interop::interop_message_search_impl(self.iris_arc().as_deref(), p).await
     }
 
     #[tool(
@@ -2923,9 +3225,9 @@ Methods:
         &self,
         Parameters(p): Parameters<search::SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         let result =
-            search::handle_iris_search(iris, self.http_client(), p, Arc::clone(&self.log_store))
+            search::handle_iris_search(&iris, self.http_client(), p, Arc::clone(&self.log_store))
                 .await;
         self.record_call("iris_search", result.is_ok());
         result
@@ -2938,9 +3240,9 @@ Methods:
         &self,
         Parameters(p): Parameters<info::InfoParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         let result =
-            info::handle_iris_info(iris, self.http_client(), p, Arc::clone(&self.log_store)).await;
+            info::handle_iris_info(&iris, self.http_client(), p, Arc::clone(&self.log_store)).await;
         self.record_call("iris_info", result.is_ok());
         result
     }
@@ -2952,8 +3254,8 @@ Methods:
         &self,
         Parameters(p): Parameters<info::MacroParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
-        let result = info::handle_iris_macro(iris, self.http_client(), p).await;
+        let iris = self.get_iris_reloaded().await?;
+        let result = info::handle_iris_macro(&iris, self.http_client(), p).await;
         self.record_call("iris_macro", result.is_ok());
         result
     }
@@ -2965,8 +3267,8 @@ Methods:
         &self,
         Parameters(p): Parameters<info::DebugParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
-        let result = info::handle_iris_debug(iris, self.http_client(), p).await;
+        let iris = self.get_iris_reloaded().await?;
+        let result = info::handle_iris_debug(&iris, self.http_client(), p).await;
         self.record_call("iris_debug", result.is_ok());
         result
     }
@@ -2978,8 +3280,8 @@ Methods:
         &self,
         Parameters(p): Parameters<info::GenerateParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
-        let result = info::handle_iris_generate(iris, self.http_client(), p).await;
+        let iris = self.get_iris_reloaded().await?;
+        let result = info::handle_iris_generate(&iris, self.http_client(), p).await;
         self.record_call("iris_generate", result.is_ok());
         result
     }
@@ -2991,8 +3293,8 @@ Methods:
         &self,
         Parameters(p): Parameters<skills_tools::SkillParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
-        let result = skills_tools::handle_skill(iris, self.http_client(), p, &self.history).await;
+        let iris = self.get_iris_reloaded().await?;
+        let result = skills_tools::handle_skill(&iris, self.http_client(), p, &self.history).await;
         self.record_call("skill", result.is_ok());
         result
     }
@@ -3004,9 +3306,10 @@ Methods:
         &self,
         Parameters(p): Parameters<skills_tools::SkillCommunityParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         let result =
-            skills_tools::handle_skill_community(iris, self.http_client(), p, &self.registry).await;
+            skills_tools::handle_skill_community(&iris, self.http_client(), p, &self.registry)
+                .await;
         self.record_call("skill_community", result.is_ok());
         result
     }
@@ -3018,8 +3321,8 @@ Methods:
         &self,
         Parameters(p): Parameters<skills_tools::KbParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
-        let result = skills_tools::handle_kb(iris, self.http_client(), p).await;
+        let iris = self.get_iris_reloaded().await?;
+        let result = skills_tools::handle_kb(&iris, self.http_client(), p).await;
         self.record_call("kb", result.is_ok());
         result
     }
@@ -3031,9 +3334,9 @@ Methods:
         &self,
         Parameters(p): Parameters<skills_tools::AgentInfoParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         let result =
-            skills_tools::handle_agent_info(iris, self.http_client(), p, &self.history).await;
+            skills_tools::handle_agent_info(&iris, self.http_client(), p, &self.history).await;
         self.record_call("agent_info", result.is_ok());
         result
     }
@@ -3045,9 +3348,9 @@ Methods:
         &self,
         Parameters(p): Parameters<ScmParams>,
     ) -> Result<CallToolResult, McpError> {
-        let iris = self.get_iris()?;
+        let iris = self.get_iris_reloaded().await?;
         let result =
-            scm::handle_iris_source_control(iris, self.http_client(), p, &self.elicitation_store)
+            scm::handle_iris_source_control(&iris, self.http_client(), p, &self.elicitation_store)
                 .await;
         self.record_call("iris_source_control", result.is_ok());
         result
@@ -3066,7 +3369,8 @@ Methods:
         Parameters(p): Parameters<serde_json::Value>,
     ) -> Result<CallToolResult, McpError> {
         let action = p.get("action").and_then(|v| v.as_str()).unwrap_or("status");
-        let iris_opt = self.iris.as_deref();
+        let _iris_arc_hold = self.iris_arc();
+        let iris_opt = _iris_arc_hold.as_deref();
         let result = match action {
             "status" => {
                 interop::interop_production_status_impl(
@@ -3198,7 +3502,8 @@ Methods:
         Parameters(p): Parameters<serde_json::Value>,
     ) -> Result<CallToolResult, McpError> {
         let what = p.get("what").and_then(|v| v.as_str()).unwrap_or("logs");
-        let iris_opt = self.iris.as_deref();
+        let _iris_arc_hold = self.iris_arc();
+        let iris_opt = _iris_arc_hold.as_deref();
         #[allow(unused_variables)]
         let result = match what {
             "logs" => {
@@ -3329,7 +3634,7 @@ Methods:
             })
             .unwrap_or_default();
         let result = interop::interop_production_item_impl(
-            self.iris.as_deref(),
+            self.iris_arc().as_deref(),
             interop::ProductionItemParams {
                 action,
                 item,
@@ -3357,7 +3662,7 @@ Methods:
             .unwrap_or("USER")
             .to_string();
         let result = interop::interop_credential_list_impl(
-            self.iris.as_deref(),
+            self.iris_arc().as_deref(),
             interop::CredentialListParams { namespace },
         )
         .await;
@@ -3373,7 +3678,7 @@ Methods:
         Parameters(p): Parameters<serde_json::Value>,
     ) -> Result<CallToolResult, McpError> {
         let result = interop::interop_credential_manage_impl(
-            self.iris.as_deref(),
+            self.iris_arc().as_deref(),
             interop::CredentialManageParams {
                 action: p
                     .get("action")
@@ -3415,7 +3720,7 @@ Methods:
         Parameters(p): Parameters<serde_json::Value>,
     ) -> Result<CallToolResult, McpError> {
         let result = interop::interop_lookup_manage_impl(
-            self.iris.as_deref(),
+            self.iris_arc().as_deref(),
             interop::LookupManageParams {
                 action: p
                     .get("action")
@@ -3451,7 +3756,7 @@ Methods:
         Parameters(p): Parameters<serde_json::Value>,
     ) -> Result<CallToolResult, McpError> {
         let result = interop::interop_lookup_transfer_impl(
-            self.iris.as_deref(),
+            self.iris_arc().as_deref(),
             interop::LookupTransferParams {
                 action: p
                     .get("action")
@@ -3486,7 +3791,8 @@ Methods:
         Parameters(p): Parameters<serde_json::Value>,
     ) -> Result<CallToolResult, McpError> {
         let action = p.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        let iris_opt = self.iris.as_deref();
+        let _iris_arc_hold = self.iris_arc();
+        let iris_opt = _iris_arc_hold.as_deref();
         let result = match action {
             "list_namespaces" => admin::admin_list_namespaces_impl(iris_opt).await,
             "list_databases" => admin::admin_list_databases_impl(iris_opt).await,
