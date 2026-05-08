@@ -1932,7 +1932,7 @@ impl IrisTools {
     }
 
     #[tool(
-        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution via CodeMode=objectgenerator (write temp class, compile, query result, delete). Falls back to docker exec if IRIS_CONTAINER env var is set and HTTP fails. Example: code='write $ZVERSION,!' returns the IRIS version string."
+        description = "Execute arbitrary ObjectScript code on IRIS and return stdout. Uses pure-HTTP execution via CodeMode=objectgenerator (write temp class, compile, query result, delete). Falls back to docker exec if IRIS_CONTAINER env var is set and HTTP fails. Example: code='write $ZVERSION,!' returns the IRIS version string. Note: &sql embedded SQL macro is not supported — use %SQL.Statement class methods or iris_query instead."
     )]
     async fn iris_execute(
         &self,
