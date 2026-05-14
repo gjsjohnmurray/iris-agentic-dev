@@ -2066,7 +2066,7 @@ impl IrisTools {
         // the objectgenerator transaction boundary; SQL %Save() does not).
         // We write the run index out and return it to identify the run in the next step.
         let run_code = format!(
-            r#"do ##class(%UnitTest.Manager).RunTest("{pattern}","/verbose=1","{token}")"#,
+            r#"do ##class(%UnitTest.Manager).RunTest("{pattern}","/verbose=1/nodelete","{token}")"#,
             token = correlation_token,
             pattern = safe_pattern,
         );
