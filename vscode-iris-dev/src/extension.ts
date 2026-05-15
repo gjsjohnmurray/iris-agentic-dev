@@ -53,8 +53,9 @@ export class IrisDevMcpProvider
       if (
         e.affectsConfiguration('objectscript.conn') ||
         e.affectsConfiguration('iris-dev.containerName') ||
-        e.affectsConfiguration('iris-dev.nativePort') ||
         e.affectsConfiguration('iris-dev.serverPath') ||
+        e.affectsConfiguration('iris-dev.tlsVerify') ||
+        e.affectsConfiguration('http.proxyStrictSSL') ||
         e.affectsConfiguration('intersystems.servers')
       ) {
         this.emitter.fire();
@@ -107,6 +108,12 @@ export class IrisDevMcpProvider
       .getConfiguration('iris-dev')
       .get<string>('containerName');
     this.log.info(`iris-dev: containerName = ${containerName}`);
+
+    // TLS verification: disabled if iris-dev.tlsVerify=false OR http.proxyStrictSSL=false.
+    const tlsVerifySetting = vscode.workspace.getConfiguration('iris-dev').get<boolean>('tlsVerify', true);
+    const proxyStrictSSL = vscode.workspace.getConfiguration('http').get<boolean>('proxyStrictSSL', true);
+    const tlsVerify = tlsVerifySetting && proxyStrictSSL;
+    this.log.info(`iris-dev: tlsVerify=${tlsVerify} (iris-dev.tlsVerify=${tlsVerifySetting}, http.proxyStrictSSL=${proxyStrictSSL})`);
 
     // Resolve named server if using intersystems.servers.
     // Server Manager writes server definitions to user settings, so we must
@@ -167,6 +174,7 @@ export class IrisDevMcpProvider
       IRIS_ISFS: isIsfs ? 'true' : undefined,
       IRIS_SERVER_NAME: conn.server ?? undefined,
       IRIS_CONTAINER: containerName ?? undefined,
+      IRIS_TLS_VERIFY: tlsVerify ? undefined : 'false',
       OBJECTSCRIPT_LEARNING: 'true',
     };
     const env: Record<string, string | number> = Object.fromEntries(
