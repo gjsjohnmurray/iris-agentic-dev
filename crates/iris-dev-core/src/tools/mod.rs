@@ -2230,6 +2230,8 @@ impl IrisTools {
                 "failed": 0,
                 "path": path_label,
                 "source": "stdout_parse",
+                "_diag_raw": run_output.trim(),
+                "_diag_cases": format!("{:?}", test_cases.iter().map(|c| c["name"].as_str().unwrap_or("?")).collect::<Vec<_>>()),
             }));
         }
 
