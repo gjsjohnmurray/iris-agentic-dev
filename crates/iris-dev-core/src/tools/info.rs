@@ -405,3 +405,141 @@ pub async fn handle_iris_generate(
         }
     }
 }
+
+// ── iris_table_info ───────────────────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TableInfoParams {
+    /// SQL table name in Schema.Table format (e.g. "SQLUser.MyTable" or "MyApp.Orders").
+    pub table: String,
+    /// IRIS namespace to query. Defaults to "USER".
+    #[serde(default = "crate::tools::default_namespace")]
+    pub namespace: String,
+    /// Include approximate row count (runs SELECT COUNT(*) — may be slow on large tables).
+    #[serde(default)]
+    pub include_row_count: bool,
+}
+
+pub async fn handle_iris_table_info(
+    iris: &crate::iris::connection::IrisConnection,
+    client: &reqwest::Client,
+    p: TableInfoParams,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    // Split "Schema.Table" → (schema, table). Tables with no dot use SQLUser schema.
+    let (sql_schema, sql_table) = match p.table.find('.') {
+        Some(idx) => (p.table[..idx].to_string(), p.table[idx + 1..].to_string()),
+        None => ("SQLUser".to_string(), p.table.clone()),
+    };
+
+    // Look up class projection: find a compiled class whose SQL mapping matches.
+    let lookup_code = format!(
+        r#"
+set sqlSchema = "{schema}", sqlTable = "{table}"
+// Check table exists at all via INFORMATION_SCHEMA
+set rsEx = ##class(%SQL.Statement).%ExecDirect(,"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?", sqlSchema, sqlTable)
+if rsEx.%Next() && (rsEx.%GetData(1) = 0) {{ write "NOT_FOUND",! quit }}
+// Look for backing class
+set rs = ##class(%SQL.Statement).%ExecDirect(,"SELECT c.Name, c.ClassType, s.DataLocation, s.IndexLocation, s.IDLocation FROM %Dictionary.CompiledClass c LEFT JOIN %Dictionary.CompiledStorage s ON s.parent = c.Name WHERE c.SqlSchemaName = ? AND c.SqlTableName = ?", sqlSchema, sqlTable)
+if rs.%Next() {{
+    write "CLASS:",rs.Name,!
+    write "CLASSTYPE:",rs.ClassType,!
+    write "DATA:",rs.DataLocation,!
+    write "INDEX:",rs.IndexLocation,!
+    write "ID:",rs.IDLocation,!
+}} else {{
+    write "DDL_TABLE",!
+}}
+"#,
+        schema = sql_schema.replace('"', "\\\""),
+        table = sql_table.replace('"', "\\\""),
+    );
+
+    let output = iris
+        .execute_via_generator(&lookup_code, &p.namespace, client)
+        .await
+        .map_err(|e| rmcp::ErrorData::internal_error(format!("execute failed: {e}"), None))?;
+
+    let lines: std::collections::HashMap<&str, &str> =
+        output.lines().filter_map(|l| l.split_once(':')).collect();
+
+    if output.trim() == "NOT_FOUND" {
+        return crate::tools::ok_json(serde_json::json!({
+            "success": false,
+            "error": format!("Table '{}' not found in namespace '{}'", p.table, p.namespace),
+            "table": p.table,
+            "namespace": p.namespace,
+        }));
+    }
+
+    let result = if lines.contains_key("CLASS") {
+        // Class-projected table
+        let class_name = lines.get("CLASS").copied().unwrap_or("").trim();
+        let data_global = lines.get("DATA").copied().unwrap_or("").trim();
+        let index_global = lines.get("INDEX").copied().unwrap_or("").trim();
+
+        let mut obj = serde_json::json!({
+            "table": p.table,
+            "type": "class_projection",
+            "class": class_name,
+            "namespace": p.namespace,
+            "data_global": if data_global.is_empty() { serde_json::Value::Null } else { data_global.into() },
+            "index_global": if index_global.is_empty() { serde_json::Value::Null } else { index_global.into() },
+            "accessible_from_embedded_python": true,
+        });
+
+        if p.include_row_count {
+            let count = get_row_count(iris, client, &p.namespace, &sql_schema, &sql_table).await;
+            obj["row_count"] = count.into();
+        }
+        obj
+    } else {
+        // DDL-created table — infer global names by IRIS naming convention
+        let data_global = format!("^{}.{}D", sql_schema, sql_table);
+        let index_global = format!("^{}.{}I", sql_schema, sql_table);
+        let id_counter_global = format!("^{}.{}C", sql_schema, sql_table);
+
+        let mut obj = serde_json::json!({
+            "table": p.table,
+            "type": "ddl_table",
+            "namespace": p.namespace,
+            "data_global": data_global,
+            "index_global": index_global,
+            "id_counter_global": id_counter_global,
+            "accessible_from_embedded_python": true,
+        });
+
+        if p.include_row_count {
+            let count = get_row_count(iris, client, &p.namespace, &sql_schema, &sql_table).await;
+            obj["row_count"] = count.into();
+        }
+        obj
+    };
+
+    crate::tools::ok_json(serde_json::json!({
+        "success": true,
+        "result": result,
+    }))
+}
+
+async fn get_row_count(
+    iris: &crate::iris::connection::IrisConnection,
+    client: &reqwest::Client,
+    namespace: &str,
+    schema: &str,
+    table: &str,
+) -> serde_json::Value {
+    let code = format!(
+        r#"set rs = ##class(%SQL.Statement).%ExecDirect(,"SELECT COUNT(*) FROM ""{schema}"".{table}")
+if rs.%Next() {{ write rs.%GetData(1),! }} else {{ write "error",! }}"#,
+        schema = schema.replace('"', "\\\""),
+        table = table.replace('"', "\\\""),
+    );
+    match iris.execute_via_generator(&code, namespace, client).await {
+        Ok(out) => out
+            .trim()
+            .parse::<u64>()
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::Value::Null,
+    }
+}

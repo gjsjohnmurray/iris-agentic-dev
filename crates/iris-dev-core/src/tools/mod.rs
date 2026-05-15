@@ -1381,6 +1381,7 @@ impl IrisTools {
             "iris_search",
             "iris_info",
             "iris_macro",
+            "iris_table_info",
             "debug_capture_packet",
             "debug_get_error_logs",
             "iris_generate",
@@ -3562,6 +3563,19 @@ Methods:
         let result =
             info::handle_iris_info(&iris, self.http_client(), p, Arc::clone(&self.log_store)).await;
         self.record_call("iris_info", result.is_ok());
+        result
+    }
+
+    #[tool(
+        description = "Inspect a SQL table: returns whether it is a class-projected table or DDL-created, the backing data/index globals, and (optionally) an approximate row count. Works for both class-projected tables (with real storage globals from %Dictionary.CompiledStorage) and DDL tables (globals inferred by IRIS naming convention). Use include_row_count=true to add a COUNT(*) estimate."
+    )]
+    async fn iris_table_info(
+        &self,
+        Parameters(p): Parameters<info::TableInfoParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let iris = self.get_iris_reloaded().await?;
+        let result = info::handle_iris_table_info(&iris, self.http_client(), p).await;
+        self.record_call("iris_table_info", result.is_ok());
         result
     }
 

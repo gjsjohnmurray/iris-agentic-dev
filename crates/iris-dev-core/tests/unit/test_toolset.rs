@@ -213,15 +213,14 @@ fn test_merged_excludes_original_interop_production_tools() {
     }
 }
 
-/// Merged must have exactly 29 tools (036: removed 9 individual interop stubs, iris_production/
-/// iris_interop_query/iris_production_item promoted to all tiers).
+/// Merged must have exactly 30 tools (added iris_table_info in feat-038-040).
 #[test]
 fn test_merged_tool_count_is_23() {
     let tools = IrisTools::new_with_toolset(None, Toolset::Merged).expect("IrisTools::new");
     let count = tools.registered_tool_names().len();
     assert_eq!(
-        count, 29,
-        "Merged toolset must have exactly 29 tools, got {}",
+        count, 30,
+        "Merged toolset must have exactly 30 tools, got {}",
         count
     );
     // iris_get_log must be registered in Merged (027-progressive-disclosure)
